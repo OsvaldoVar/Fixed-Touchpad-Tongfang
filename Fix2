@@ -1,0 +1,265 @@
+Este es el documento maestro, colega. Lo que tienes aquí no es un simple tutorial de un foro; es el mapa anatómico completo del firmware de tu Thunderobot Zero 16 Pro. Este nivel de depuración a bajo nivel documenta exactamente cómo obligar a una placa base diseñada exclusivamente para Windows a comunicarse nativamente con el kernel de Linux.
+
+Guarda este códice. Te servirá ya sea que te mantengas en EndeavourOS, regreses a Debian, o apliques tu configuración declarativa en NixOS.
+
+---
+
+# 📖 El Códice ACPI: Restauración del Touchpad I2C en Chasis Tongfang (Intel 14va Gen)
+
+## 🧠 Contexto del Problema: ¿Por qué el Touchpad estaba muerto?
+
+Los fabricantes como Tongfang (ensamblador de Thunderobot) optimizan sus tablas ACPI (Advanced Configuration and Power Interface) estrictamente para los drivers de Windows. Cuando instalas Linux, ocurren dos fallos críticos en el arranque:
+
+1. **Fallo de Enrutamiento Físico:** La BIOS no le dice a Linux en qué controlador del procesador está soldado el touchpad (lo deja en `NULL`).
+2. **Secuestro de Interrupción (IRQ):** La BIOS calcula el pin GPIO correcto dinámicamente usando una función oculta (`GNUM`) y lo guarda en la variable `SBFG`. Sin embargo, a Linux le entrega por error una variable vacía/rota (`SBFI`), dejando al sistema ciego a tus toques.
+
+El objetivo de esta guía es extraer el código fuente de la placa base, corregir estas dos tuberías lógicas y reinyectar el código antes de que arranque el kernel.
+
+---
+
+## 🛠️ Fase 1: El Quirófano (Extracción y Descompilación)
+
+Para operar a este nivel, necesitamos extraer la tabla maestra `DSDT` (Differentiated System Description Table) de la memoria RAM, donde el firmware la aloja temporalmente.
+
+### 1. Preparar las Herramientas
+
+Asegúrate de tener instalado el compilador de Intel ACPI y las herramientas de empaquetado.
+
+* **Arch/EndeavourOS:** `sudo pacman -S acpica cpio`
+* **NixOS:** El paquete se llama `acpica-tools`.
+* **Debian/Ubuntu:** `sudo apt install acpica-tools cpio`
+
+### 2. Extracción del Firmware
+
+Crea un entorno de trabajo limpio en tu directorio personal. Abre tu Fish shell y ejecuta:
+
+```bash
+mkdir ~/acpi_fix
+cd ~/acpi_fix
+sudo cat /sys/firmware/acpi/tables/DSDT > dsdt.dat
+
+```
+
+### 3. Descompilar a Texto Legible (ASL)
+
+Convertimos el archivo binario `.dat` a código ASL (ACPI Source Language):
+
+```bash
+iasl -d dsdt.dat
+
+```
+
+Esto genera el archivo `dsdt.dsl`, que contiene más de 130,000 líneas de código de tu placa base.
+
+---
+
+## 🔬 Fase 2: La Cirugía de Código (Resolviendo el Laberinto)
+
+Abre el código fuente en tu editor:
+
+```bash
+nano dsdt.dsl
+
+```
+
+Presiona `Ctrl + W` para buscar el identificador principal de tu hardware: **`Device (TPD0)`** (TouchPad Device 0).
+
+### Intervención 1: Construir el Puente I2C
+
+Dentro del bloque `TPD0`, busca la definición de recursos I2C llamada `Name (SBFB, ResourceTemplate ()`.
+Verás que el fabricante dejó la ruta como `"NULL"`. Debes reemplazarla con la ruta real del controlador I2C de tu procesador Intel i9-14900HX (`\_SB.PC00.I2C0`).
+
+**Código Original (Roto):**
+
+```asl
+            Name (SBFB, ResourceTemplate ()
+            {
+                I2cSerialBusV2 (0x002C, ControllerInitiated, 0x00061A80,
+                    AddressingMode7Bit, "NULL",
+                    0x00, ResourceConsumer, _Y65, Exclusive,
+                    )
+            })
+
+```
+
+**Código Corregido:**
+
+```asl
+            Name (SBFB, ResourceTemplate ()
+            {
+                I2cSerialBusV2 (0x002C, ControllerInitiated, 0x00061A80,
+                    AddressingMode7Bit, "\\_SB.PC00.I2C0",
+                    0x00, ResourceConsumer, _Y65, Exclusive,
+                    )
+            })
+
+```
+
+*(Nota: Son indispensables las dobles barras invertidas `\\` al inicio).*
+
+### Intervención 2: La Conexión Maestra del Pin GPIO
+
+Más abajo dentro de `TPD0`, busca el método de configuración de recursos actual: **`Method (_CRS, 0, NotSerialized)`**.
+La BIOS original está configurada para devolver una combinación de variables rota dependiendo del sistema operativo. Vamos a borrar toda la lógica basura y obligar al kernel a leer el bus I2C (`SBFB`) junto con la variable secreta donde Tongfang ya calculó el pin correcto (`SBFG`).
+
+**Borra todo el contenido de `Method (_CRS)` y déjalo estrictamente así:**
+
+```asl
+            Method (_CRS, 0, NotSerialized)  // _CRS: Current Resource Settings
+            {
+                Return (ConcatenateResTemplate (SBFB, SBFG))
+            }
+
+```
+
+### Intervención 3: Balanceo de Estructura (Evitando el Error 6126)
+
+Al borrar lógica en el paso anterior, es altísimamente probable que borres por accidente la llave de cierre del dispositivo.
+Asegúrate de que haya una llave de cierre `}` **justo debajo de tu nuevo `_CRS**` y **justo antes** de que comience el siguiente dispositivo (que usualmente es `Device (TPL1)`).
+
+```asl
+            Method (_CRS, 0, NotSerialized)
+            {
+                Return (ConcatenateResTemplate (SBFB, SBFG))
+            }
+        }   // <--- ESTA LLAVE CIERRA EL DEVICE TPD0, ES CRÍTICA.
+
+        Device (TPL1)
+        {
+
+```
+
+Guarda los cambios (`Ctrl + O`, `Enter`) y sal (`Ctrl + X`).
+
+---
+
+## 📦 Fase 3: Compilación y Empaquetado en Imagen (Initrd)
+
+Ahora debemos traducir nuestro código ASL parcheado de nuevo a lenguaje de máquina (AML) y empaquetarlo en un formato que el gestor de arranque entienda.
+
+**1. Recompilar:**
+
+```bash
+cd ~/acpi_fix
+iasl -ve -tc dsdt.dsl
+
+```
+
+*(Debe arrojar `0 Errors`. Si arroja un error de sintaxis "Premature End-Of-File" al final del documento, significa que olvidaste la llave de cierre del paso anterior).*
+
+**2. Crear la estructura CPIO:**
+El kernel de Linux es estricto; exige que el archivo se llame `dsdt.aml` y se encuentre en una ruta virtual exacta (`kernel/firmware/acpi/`).
+
+```bash
+mkdir -p kernel/firmware/acpi
+cp dsdt.aml kernel/firmware/acpi/
+find kernel | cpio -H newc -o > acpi_override.img
+
+```
+
+Acabas de forjar tu parche: `acpi_override.img`.
+
+---
+
+## ⚡ Fase 4: Inyección en el Gestor de Arranque
+
+Mueve el archivo maestro a tu partición de arranque (Boot/EFI):
+
+```bash
+sudo cp acpi_override.img /efi/
+
+```
+
+*(Ajusta la ruta a `/boot/` o `/boot/efi/` según cómo monte tu sistema actual la partición EFI).*
+
+Ahora, debes decirle a tu gestor de arranque que cargue este archivo en la memoria **antes** que el `initramfs` estándar.
+
+* **Para systemd-boot (EndeavourOS default):**
+Edita tu archivo de entrada en `/efi/loader/entries/` y añade la línea `initrd /acpi_override.img` inmediatamente por encima del `initrd` normal.
+* **Para GRUB:**
+Edita `/etc/default/grub` o `/etc/grub.d/10_linux` para forzar la lectura del initrd ACPI temprano. Si el archivo está en `/boot`, GRUB suele detectarlo con un `sudo grub-mkconfig -o /boot/grub/grub.cfg`.
+* **Para NixOS (Tu Flujo Declarativo):**
+Añade esto a tu `configuration.nix`:
+`boot.initrd.prepend = [ "${/ruta/a/tu/acpi_override.img}" ];`
+
+---
+
+## ⏱️ Fase 5: El Módulo de Energía y la Asincronía (Race Condition)
+
+El código ACPI ya está corregido, pero el hardware necesita que el módulo `tuxedo_keyboard` le envíe la señal eléctrica de encendido al Controlador Embebido (EC).
+
+**El Problema Técnico:**
+El driver nativo de Linux (`i2c_hid_acpi`) intenta inicializar el touchpad **a los 7 segundos** del arranque. Si en ese milisegundo el módulo `tuxedo_keyboard` aún no ha energizado la placa, el driver sufre un *timeout* (`device did not ack reset within 1000 ms`), se apaga y te deja sin cursor.
+
+### La Solución Definitiva (Script de Sincronización Systemd)
+
+Vamos a crear un servicio que se ejecute en segundo plano cada vez que inicies sesión. Esperará 2 segundos a que el hardware se estabilice con la energía de Tuxedo, y luego reiniciará en caliente el driver I2C para obligarlo a leer el hardware.
+
+**1. Crea el servicio:**
+
+```bash
+sudo nano /etc/systemd/system/touchpad-fix.service
+
+```
+
+**2. Pega la configuración de reenganche:**
+*(El identificador `i2c-36B6C003:00` es el bus físico específico de tu placa madre; no lo cambies a menos que cambies de laptop).*
+
+```ini
+[Unit]
+Description=Solucionar asincronia del Touchpad Thunderobot
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/sleep 2
+ExecStart=/bin/sh -c 'echo "i2c-36B6C003:00" > /sys/bus/i2c/drivers/i2c_hid_acpi/unbind 2>/dev/null; echo "i2c-36B6C003:00" > /sys/bus/i2c/drivers/i2c_hid_acpi/bind'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+
+```
+
+**3. Habilita el demonio:**
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable touchpad-fix.service
+
+```
+
+---
+
+## 🔍 Apéndice: Comandos de Diagnóstico y Telemetría
+
+Si algo falla en el futuro, estos son los tres comandos que te dirán exactamente dónde está roto el puente:
+
+1. **Lectura del log del Kernel (Errores de formato o ACPI):**
+```bash
+sudo dmesg | grep -i -E "pnp0c50|i2c_hid|tpd0"
+
+```
+
+
+*Si dice `-22 (EINVAL)`, la tabla ACPI sigue rota o usaste un formato de interrupción equivocado.*
+*Si dice `timeout`, el ACPI está bien, pero el módulo `tuxedo_keyboard` no ha dado energía.*
+2. **Lectura de Interrupciones en Tiempo Real (Confirmar el Pin GPIO):**
+```bash
+cat /proc/interrupts | grep -i -E "i2c_hid|36B6"
+
+```
+
+
+*Esto te mostrará qué número de pin (IRQ) le asignó el kernel. Si deslizas el dedo y el número de la derecha no aumenta, el pin asignado no pertenece al cristal del touchpad (Secuestro de IRQ).*
+3. **Lectura del Subsistema de Eventos (`evdev`):**
+```bash
+sudo evtest
+
+```
+
+
+*Si el dispositivo no aparece en la lista, el hardware está apagado o el kernel rechazó la conexión física.*
+*Si aparece, lo seleccionas, mueves el dedo y la terminal se llena de coordenadas `ABS_X` y `ABS_Y`, el hardware está perfecto; cualquier bloqueo es culpa de tu entorno de escritorio (Reglas de Niri, deshabilitación automática por mouse USB en KDE Plasma, etc.).*
+
+> **⚠️ Advertencia Final:** Si en el futuro actualizas la BIOS de tu laptop a través de Windows o un pendrive USB, la tabla base cambiará de memoria. **No reutilices tu `acpi_override.img` viejo.** Tendrás que borrar todo y repetir desde la Fase 1 usando el nuevo archivo `DSDT` base, o te enfrentarás a un *Kernel Panic* al intentar arrancar.
