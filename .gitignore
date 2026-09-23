@@ -1,0 +1,15 @@
+# ACPI build artifacts
+*.aml
+*.dat
+*.hex
+*.lst
+acpi_override.img
+
+# Local working directories
+acpi_fix/
+kernel/
+
+# Editor / OS metadata
+.DS_Store
+*.swp
+*.swo
