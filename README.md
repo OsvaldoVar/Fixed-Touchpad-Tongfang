@@ -113,8 +113,6 @@ ls /sys/bus/i2c/drivers/i2c_hid_acpi/
 
 a oneshot systemd service can unbind and rebind the device after module initialization.
 
-The included `thunderobot_acpi_fix.sh` script automates the extraction, compilation, packaging, and service installation steps, but deliberately leaves bootloader modification manual.
-
 ## BIOS and kernel updates
 
 A BIOS update may change the DSDT. Regenerate and review the override instead of reusing an old `dsdt.aml`.
@@ -124,8 +122,7 @@ Kernel updates normally do not require rebuilding the ACPI table itself, but cha
 ## Repository contents
 
 - `README.md`: documented procedure and assumptions.
-- `thunderobot_acpi_fix.sh`: assisted workflow for generating and installing the override.
 
 ## Disclaimer
 
-This repository documents a hardware-specific workaround. Review the generated ACPI source and understand the changes before installing an override on another system.
+This repository is an independent, unofficial, and non-definitive record. It was tested only on the Thunderobot Zero 16 described here. Each person decides whether to use the procedure on their own equipment and accepts the associated risks. The author does not accept responsibility for damage, data loss, boot failure, or other effects caused by use or misuse of this information. Review the generated ACPI source and keep a recovery boot entry before you apply an override.
